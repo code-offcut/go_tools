@@ -3,14 +3,14 @@ package copy
 import (
 	"fmt"
 	"github.com/pkg/errors"
-	paths2 "go_tools/files/paths"
-	"go_tools/gopool"
 	"go_tools/log"
+	"go_tools/paths"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,32 +21,28 @@ const (
 type CopyFiles struct {
 	SourcePath  string        `json:"source_path"`
 	TargetPath  string        `json:"target_path"`
-	Parallelism int           `json:"parallelism"`
 	FailFiles   []FailItem    `json:"fail_files"`
 	FileNumber  int64         `json:"file_number"`
 	DirNumber   int64         `json:"dir_number"`
 	todoFileNum int           `json:"-"`
 	todoFiles   chan TodoFile `json:"-"`
 	endFlag     bool          `json:"-"`
+	sync.RWMutex
 }
 
-func Get(oriPath, targetPath string, parallelism int) (*CopyFiles, error) {
+func Get(oriPath, targetPath string) (*CopyFiles, error) {
 	if len(oriPath) == 0 {
 		return nil, errors.New("source path is empty")
 	}
 	if len(targetPath) == 0 {
 		return nil, errors.New("target path is empty")
 	}
-	if parallelism <= 0 {
-		parallelism = runtime.NumCPU() * 2
-	}
 	return &CopyFiles{
-		SourcePath:  oriPath,
-		TargetPath:  targetPath,
-		Parallelism: parallelism,
-		FailFiles:   []FailItem{},
-		todoFiles:   make(chan TodoFile, parallelism*2),
-		endFlag:     false,
+		SourcePath: oriPath,
+		TargetPath: targetPath,
+		FailFiles:  []FailItem{},
+		todoFiles:  make(chan TodoFile, runtime.NumCPU()*2),
+		endFlag:    false,
 	}, nil
 }
 
@@ -71,7 +67,7 @@ func (c *CopyFiles) Copy() ([]FailItem, error) {
 	go c.copyFile()
 
 	// 生产者，生产需要 copy 的文件列表
-	_, err = paths2.DoIterPath(c.SourcePath, func(fileInfo *paths2.FileInfo, iterErr error) error {
+	_, err = paths.DoIterPath(c.SourcePath, func(fileInfo *paths.FileInfo, iterErr error) error {
 		if iterErr != nil {
 			c.FailFiles = append(c.FailFiles, FailItem{
 				Path:   fileInfo.Path,
@@ -105,7 +101,7 @@ func (c *CopyFiles) Copy() ([]FailItem, error) {
 	return c.FailFiles, nil
 }
 
-func (c *CopyFiles) doCopy(fileInfo *paths2.FileInfo, targetPath string) error {
+func (c *CopyFiles) doCopy(fileInfo *paths.FileInfo, targetPath string) error {
 	if fileInfo.IsDir {
 		c.DirNumber += 1
 		if err := os.MkdirAll(targetPath, os.ModePerm); err != nil {
@@ -119,8 +115,10 @@ func (c *CopyFiles) doCopy(fileInfo *paths2.FileInfo, targetPath string) error {
 			}
 		}
 	} else {
+		c.Lock()
 		c.FileNumber += 1
 		c.todoFileNum += 1
+		c.Unlock()
 		c.todoFiles <- TodoFile{
 			FileInfo:   fileInfo,
 			TargetPath: targetPath,
@@ -130,57 +128,57 @@ func (c *CopyFiles) doCopy(fileInfo *paths2.FileInfo, targetPath string) error {
 }
 
 func (c *CopyFiles) copyFile() {
-	pool := gopool.New(c.Parallelism)
 	for true {
 		fileInfo := <-c.todoFiles
+		c.Lock()
 		c.todoFileNum -= 1
-		go func() {
-			pool.Add(1)
-			defer pool.Done()
-			sourceFile, err := os.Open(fileInfo.FileInfo.Path)
-			if err != nil {
-				c.FailFiles = append(c.FailFiles, FailItem{
-					Path:   fileInfo.FileInfo.Path,
-					Reason: fmt.Sprintf("open source file error: %v ", err),
-				})
-				return
-			}
-			defer func() {
-				if err := sourceFile.Close(); err != nil {
-					log.Debug(err.Error())
-				}
-			}()
-			destination, err := os.Create(fileInfo.TargetPath)
-			if err != nil {
-				c.FailFiles = append(c.FailFiles, FailItem{
-					Path:   fileInfo.FileInfo.Path,
-					Reason: fmt.Sprintf("open target file path %v error: %v", fileInfo.TargetPath, err),
-				})
-				return
-			}
-			defer func() {
-				if err := destination.Close(); err != nil {
-					log.Debug(err.Error())
-				}
-			}()
-			var cache []byte
-			if maxCacheSize > fileInfo.FileInfo.Size {
-				cache = make([]byte, fileInfo.FileInfo.Size+1)
-			} else {
-				cache = make([]byte, maxCacheSize)
-			}
-			_, err = io.CopyBuffer(destination, sourceFile, cache)
-			if err != nil {
-				c.FailFiles = append(c.FailFiles, FailItem{
-					Path:   fileInfo.FileInfo.Path,
-					Reason: fmt.Sprintf("copy file error: %v", err),
-				})
-				return
-			}
-		}()
+		c.Unlock()
+		c.copyItem(&fileInfo)
 		if c.endFlag && c.todoFileNum == 0 { // 遍历已经结束，而且所有待 copy 文件已经进入 copy 流程。只需要等待所有 copy 协程结束就可以了
-			pool.Wait()
 			return
 		}
+	}
+}
+
+func (c *CopyFiles) copyItem(fileInfo *TodoFile) {
+	sourceFile, err := os.Open(fileInfo.FileInfo.Path)
+	if err != nil {
+		c.FailFiles = append(c.FailFiles, FailItem{
+			Path:   fileInfo.FileInfo.Path,
+			Reason: fmt.Sprintf("open source file error: %v ", err),
+		})
+		return
+	}
+	defer func() {
+		if err := sourceFile.Close(); err != nil {
+			log.Debug(err.Error())
+		}
+	}()
+	destination, err := os.Create(fileInfo.TargetPath)
+	if err != nil {
+		c.FailFiles = append(c.FailFiles, FailItem{
+			Path:   fileInfo.FileInfo.Path,
+			Reason: fmt.Sprintf("open target file path %v error: %v", fileInfo.TargetPath, err),
+		})
+		return
+	}
+	defer func() {
+		if err := destination.Close(); err != nil {
+			log.Debug(err.Error())
+		}
+	}()
+	var cache []byte
+	if maxCacheSize > fileInfo.FileInfo.Size {
+		cache = make([]byte, fileInfo.FileInfo.Size+1)
+	} else {
+		cache = make([]byte, maxCacheSize)
+	}
+	_, err = io.CopyBuffer(destination, sourceFile, cache)
+	if err != nil {
+		c.FailFiles = append(c.FailFiles, FailItem{
+			Path:   fileInfo.FileInfo.Path,
+			Reason: fmt.Sprintf("copy file error: %v", err),
+		})
+		return
 	}
 }

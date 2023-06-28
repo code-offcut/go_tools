@@ -17,3 +17,11 @@ func MarshalToString(data interface{}) (string, error) {
 	}
 	return string(bytes), nil
 }
+
+func MustMarshalToString(data interface{}) string {
+	toString, err := MarshalToString(data)
+	if err != nil {
+		return ""
+	}
+	return toString
+}
