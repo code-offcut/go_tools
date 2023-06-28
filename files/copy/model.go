@@ -1,7 +1,7 @@
 package copy
 
 import (
-	"go_tools/files/paths"
+	"go_tools/paths"
 )
 
 type FailItem struct {

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"github.com/klauspost/pgzip"
 	"github.com/pkg/errors"
-	paths2 "go_tools/files/paths"
 	"go_tools/log"
+	"go_tools/paths"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,13 +16,16 @@ import (
 )
 
 type GzipInfo struct {
-	SourcePath       string `json:"source_path"`
-	TargetPath       string `json:"target_path"`
-	Parallelism      int    `json:"parallelism"`
-	BlockSize        int64  `json:"block_size"`
-	IsCompress       bool   `json:"is_compress"`
-	IsDir            bool   `json:"is_dir"`
-	IgnoreFailedFile bool   `json:"ignore_failed_file"`
+	SourcePath       string   `json:"source_path"`
+	TargetPath       string   `json:"target_path"`
+	Parallelism      int      `json:"parallelism"`
+	BlockSize        int64    `json:"block_size"`
+	IsCompress       bool     `json:"is_compress"`
+	IsDir            bool     `json:"is_dir"`
+	IgnoreFailedFile bool     `json:"ignore_failed_file"`
+	DirNum           int64    `json:"dir_num"`
+	FileNum          int64    `json:"file_num"`
+	FailFiles        []string `json:"fail_files"`
 }
 
 func Get(sourcePath string, targetPath string, parallelism int, blockSize int64, isCompress, ignoreFailedFile bool) (result *GzipInfo, err error) {
@@ -67,7 +70,7 @@ func Get(sourcePath string, targetPath string, parallelism int, blockSize int64,
 	if targetPath, err = filepath.Abs(targetPath); err != nil {
 		return nil, errors.Wrap(err, "format target path error")
 	} else {
-		if paths2.IsDir(targetPath) { // target 是目录
+		if paths.IsDir(targetPath) { // target 是目录
 			if isCompress {
 				if result.IsDir {
 					targetPath = filepath.Join(targetPath, "target.tar.gz") // 默认压缩包名称
@@ -85,7 +88,7 @@ func Get(sourcePath string, targetPath string, parallelism int, blockSize int64,
 
 func (g *GzipInfo) Compress() error {
 	// file write
-	fw, err := paths2.CreateFile(g.TargetPath)
+	fw, err := paths.CreateFile(g.TargetPath)
 	if err != nil {
 		panic(err)
 	}
@@ -104,7 +107,6 @@ func (g *GzipInfo) Compress() error {
 	if g.IsDir {
 		gzWriter.Comment = "dir"
 	}
-
 	// tar write
 	tarWriter := tar.NewWriter(gzWriter)
 	defer func() {
@@ -113,15 +115,26 @@ func (g *GzipInfo) Compress() error {
 		}
 	}()
 	if g.IsDir {
-		_, err := paths2.DoIterPath(g.SourcePath, func(fileInfo *paths2.FileInfo, iterErr error) error {
+		ticker := time.NewTicker(time.Second * 3)
+		go func() {
+			for {
+				<-ticker.C
+				log.Info("compress success dir number: %v && file number: %v, failed number: %v", g.DirNum, g.FileNum, len(g.FailFiles))
+			}
+		}()
+		_, err := paths.DoIterPath(g.SourcePath, func(fileInfo *paths.FileInfo, iterErr error) error {
 			if iterErr != nil {
 				log.Warn(iterErr.Error())
 				return nil
 			}
-			if !fileInfo.IsDir {
+			if fileInfo.IsDir {
+				g.DirNum += 1
+			} else {
+				g.FileNum += 1
 				if err := g.gzip(fileInfo, tarWriter); err != nil {
 					log.Warn(err.Error())
 					if !g.IgnoreFailedFile {
+						g.FailFiles = append(g.FailFiles, fmt.Sprintf("%v: %v", fileInfo.Path, err))
 						panic(err)
 					}
 				}
@@ -130,7 +143,7 @@ func (g *GzipInfo) Compress() error {
 		}, false, g.IgnoreFailedFile)
 		return err
 	} else {
-		sourceFileInfo, err := paths2.GetFileInfo(g.SourcePath)
+		sourceFileInfo, err := paths.GetFileInfo(g.SourcePath)
 		if err != nil {
 			return err
 		}
@@ -145,7 +158,7 @@ func (g *GzipInfo) Decompress() error {
 	return g.unzip()
 }
 
-func (g *GzipInfo) gzip(sourceFile *paths2.FileInfo, writer *tar.Writer) error {
+func (g *GzipInfo) gzip(sourceFile *paths.FileInfo, writer *tar.Writer) error {
 	file, err := os.Open(sourceFile.Path)
 	if err != nil {
 		return errors.Wrapf(err, "open source file %v error", sourceFile.Path)
@@ -186,7 +199,13 @@ func (g *GzipInfo) unzip() error {
 		return errors.Wrap(err, "create gzip reader error")
 	}
 	reader := tar.NewReader(gzipReader)
-	fileNumber := 0
+	ticker := time.NewTicker(time.Second * 3)
+	go func() {
+		for {
+			<-ticker.C
+			log.Info("compress success file number: %v, failed number: %v", g.FileNum, len(g.FailFiles))
+		}
+	}()
 	for {
 		header, err := reader.Next()
 		if err != nil {
@@ -198,7 +217,7 @@ func (g *GzipInfo) unzip() error {
 			}
 		}
 		decodeFilePath := filepath.Join(g.TargetPath, header.Name)
-		file, err := paths2.CreateFile(decodeFilePath)
+		file, err := paths.CreateFile(decodeFilePath)
 		if err != nil {
 			log.Warn(err.Error())
 			if !g.IgnoreFailedFile {
@@ -212,7 +231,7 @@ func (g *GzipInfo) unzip() error {
 				return errors.Wrapf(err, "writer file %v error", decodeFilePath)
 			}
 		}
-		fileNumber += 1
+		g.FileNum += 1
 	}
 	return nil
 }
